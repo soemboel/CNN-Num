@@ -3,18 +3,15 @@ title: CNN Number Recognizer
 emoji: 🔢
 colorFrom: yellow
 colorTo: orange
-sdk: docker
-app_port: 7860
+sdk: static
 pinned: false
 ---
 
 # CNN Digit Recognizer
 
 Draw a number on the canvas (e.g. `100`) and a CNN trained on MNIST reads
-each digit and returns it as text.
-
-> The YAML block above is metadata Hugging Face Spaces reads to build this
-> as a Docker Space — harmless to keep even if you only use GitHub/Render/etc.
+each digit and returns it as text — **entirely in your browser**, no
+backend server required.
 
 ## How it works
 - `train_model.py` trains a small, efficient CNN (PyTorch) on MNIST and saves
@@ -22,28 +19,65 @@ each digit and returns it as text.
   average pool instead of a big flatten+dense layer — **33,770 parameters**
   (vs. ~225k for the naive version), with **99.2%+ test accuracy**, trained
   with a OneCycle LR schedule and automatic mixed precision on GPU.
-- `app.py` is a Flask API: it serves the frontend (`index.html`, `style.css`,
-  `script.js`, each via its own explicit route — nothing else in the repo is
-  reachable over HTTP) and a `/predict` endpoint that takes the drawn image,
-  splits it into individual digit blobs with OpenCV, runs each through the
-  CNN, and returns the combined number.
-- `index.html` + `style.css` + `script.js` (project root) is the drawing UI:
-  an organic, warm-toned board. On desktop it's a two-column layout — draw on
-  the left, live confidence charts on the right; it stacks into one column on
-  narrow/mobile screens. It draws white strokes on a black canvas (same
-  format as MNIST), sends a PNG snapshot to `/predict`, and renders a bar
-  chart per detected digit showing the CNN's full 0-9 probability
-  distribution (the winning digit is highlighted and labeled). These three
-  files live at the repo root (not in a subfolder) so they can be deployed
-  as-is to a static host like Cloudflare Pages.
+- `export_onnx.py` converts the trained model to `model.onnx` (~145KB), a
+  self-contained format that runs via [onnxruntime-web](https://github.com/microsoft/onnxruntime)
+  — no Python needed to serve predictions.
+- `index.html` + `style.css` + `script.js` (project root) is the whole app:
+  an organic, warm-toned board where you draw. On desktop it's a two-column
+  layout — draw on the left, live confidence charts on the right; it stacks
+  into one column on narrow/mobile screens. When you click Predict, it:
+  1. reads the canvas pixels and finds each digit blob with a
+     connected-component algorithm (a JS port of what `cv2.findContours`
+     used to do server-side),
+  2. pads and downscales each blob to a 28x28 tensor the same way MNIST
+     images are shaped,
+  3. runs `model.onnx` locally via onnxruntime-web (WebAssembly) to get a
+     prediction, and
+  4. renders a bar chart per digit showing the CNN's full 0-9 probability
+     distribution (the winning digit is highlighted and labeled).
 
-## Run locally
+  Because all of this runs client-side, these three files (plus
+  `model.onnx`) are the *entire* deployable app — drop them on any static
+  host and it works.
+
+### Optional: Flask API (`app.py`)
+This repo also keeps a Flask + PyTorch server (`app.py`, `Dockerfile`) that
+does the same thing server-side via a `/predict` endpoint, from back when
+this was backend-hosted. It's no longer needed for the default setup above,
+but it's kept in case you'd rather run inference server-side (e.g. swapping
+in a bigger model later that's too heavy for a browser). See
+[Optional: run it as a server](#optional-run-it-as-a-server) below.
+
+## Run it
+Just open `index.html` through a local web server (opening the file
+directly via `file://` will block the WASM/model loading in most browsers):
+```bash
+python -m http.server 8000
+```
+Then open http://localhost:8000, draw a number, click **Predict**.
+
+## Hosting it
+Since the whole app is static files, deploy it to any static host —
+literally drag-and-drop `index.html`, `style.css`, `script.js`, and
+`model.onnx` into any of these, no build step, no card, no server:
+
+- **Cloudflare Pages** — connect this GitHub repo, leave the build command
+  empty and build output directory as `/` (default).
+- **Hugging Face Spaces** — the `Static` SDK (free for everyone, no PRO
+  plan needed) works great here too.
+- **GitHub Pages**, **Netlify**, or literally any static file host.
+
+(Pages/Spaces will also upload `app.py`, `Dockerfile`, `requirements.txt`,
+etc. as inert static files since they're in the repo — harmless, just
+unused, since nothing executes them.)
+
+## Retraining / changing the model
 ```bash
 pip install -r requirements.txt
 python train_model.py     # trains the CNN, saves model/mnist_cnn.pt
-python app.py              # starts the API + website at http://localhost:5000
+python export_onnx.py     # re-exports model.onnx for the browser to use
 ```
-Open http://localhost:5000, draw a number, click **Predict**.
+Redeploy the static site afterward so it picks up the new `model.onnx`.
 
 ### GPU or CPU training
 `train_model.py` auto-detects a CUDA GPU and uses it automatically, falling
@@ -54,13 +88,12 @@ python train_model.py --device cpu     # force CPU
 python train_model.py --device cuda    # force GPU (errors if none found)
 python train_model.py --epochs 15      # train longer
 ```
-`app.py` picks the same device automatically for inference.
 
 **If you have an NVIDIA GPU but it's not being detected:** plain
 `pip install torch` (what `requirements.txt` installs) gives you the
-**CPU-only** build — that's deliberate, since it keeps the app light for
-hosting where there's no GPU anyway. To let PyTorch use your GPU for local
-training, install the CUDA build on top of it:
+**CPU-only** build — that's deliberate, since it keeps the install light.
+To let PyTorch use your GPU for local training, install the CUDA build on
+top of it:
 ```bash
 pip install torch==2.14.0+cu126 --index-url https://download.pytorch.org/whl/cu126
 ```
@@ -72,61 +105,23 @@ visible at all). Verify it worked with:
 python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 ```
 
-## Hosting it
-
-**Cloudflare (Pages/Workers) cannot run `app.py`** — there's no Python/PyTorch
-runtime there, and the model + its dependencies are far past what a Worker
-allows. Cloudflare is a great fit for the *frontend only*; the Flask + CNN
-backend needs a real Python host. Two ways to deploy:
-
-### Option A — one host runs everything (simplest)
-`app.py` already serves the frontend itself, so deploying the whole repo
-to any Python host serves both the site and the API from one URL. Start
-command: `gunicorn app:app` (already in requirements.txt), or `python app.py`
-for a quick test. Nothing else to configure — `script.js`'s `API_URL` can
-stay empty/relative since frontend and API share an origin.
-
-Where to run it: **Render, Railway, and Fly.io now require a credit card on
-file** even for their free tiers (for verification — you're not charged
-unless you upgrade, but not everyone wants to hand over a card for a hobby
-project). If you'd rather avoid that:
-
-- **Hugging Face Spaces** — free, **no credit card**, and literally built
-  for hosting ML demos like this one. This repo already includes a
-  `Dockerfile` + `.dockerignore` for it, and the YAML block at the top of
-  this README is the Space config it reads (`sdk: docker`, `app_port: 7860`).
-  To deploy:
-  1. Create a free account at huggingface.co, then **New Space** → pick
-     **Docker** as the SDK (not Gradio/Streamlit).
-  2. Push this repo to the Space's git remote (shown on the Space's page,
-     looks like `https://huggingface.co/spaces/<you>/<space-name>`):
-     ```bash
-     git remote add space https://huggingface.co/spaces/<you>/<space-name>
-     git push space main
-     ```
-  3. The Space builds the Dockerfile automatically. Once it's live, your API
-     is reachable at `https://<you>-<space-name>.hf.space`.
-  4. Free-tier Spaces sleep after a period of inactivity and take a bit to
-     wake back up on the next request (same tradeoff as free Render/Railway).
-
-### Option B — frontend on Cloudflare Pages, backend elsewhere
-1. **Backend:** deploy `app.py` using Option A (Hugging Face Spaces, or
-   Render/Railway/Fly.io if you don't mind the card requirement). Note the
-   URL it gives you, e.g. `https://you-space-name.hf.space`.
-2. **Frontend:** create a Cloudflare Pages project from this GitHub repo.
-   Since `index.html` now lives at the repo root, you can leave Pages'
-   "build output directory" as `/` (the default) — no build command needed,
-   it's static files. (Pages will also upload the `.py` files,
-   `requirements.txt`, and `Dockerfile` as inert static assets since they're
-   in the repo; they aren't executed and aren't secret, just unused —
-   harmless either way.)
-3. Set `API_URL` at the top of `script.js` to your backend's full URL from
-   step 1, then redeploy the Pages site. CORS is already enabled in `app.py`
-   via `flask-cors`, so the cross-origin calls from your `.pages.dev` domain
-   to your backend's domain work out of the box.
+## Optional: run it as a server
+If you'd rather do inference server-side instead of in the browser:
+```bash
+python app.py              # starts the API + website at http://localhost:5000
+```
+`app.py` serves the same frontend plus a `/predict` endpoint (image in,
+prediction out, via OpenCV + PyTorch). To host it, you need a real Python
+runtime — note that free tiers on Render/Railway/Fly.io now require a card
+for verification, and Hugging Face Spaces now requires a paid PRO plan to
+create a Docker Space (Static Spaces remain free, which is what the
+client-side version above uses instead). A `Dockerfile` is included if you
+do have somewhere to run it. Set `API_URL` at the top of `script.js` to
+point back at `/predict` if you go this route and want the frontend to call
+it instead of running the model locally.
 
 ## Notes
 - Draw digits reasonably large and spaced apart so they don't touch —
   touching digits get segmented as one blob.
 - Retraining with more epochs or data augmentation in `train_model.py` will
-  improve accuracy further.
+  improve accuracy further — just re-run `export_onnx.py` afterward.

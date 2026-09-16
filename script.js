@@ -1,6 +1,10 @@
-// If you host the frontend separately from the Flask API, change this
-// to the full URL of your API, e.g. "https://your-api.onrender.com"
-const API_URL = "http://localhost:5000";
+// Everything here runs in the browser — no backend server involved.
+// The trained CNN (model.onnx, ~9KB) is loaded once and run locally via
+// onnxruntime-web (WebAssembly), so this page works as pure static hosting.
+
+ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/";
+
+const MODEL_URL = "model.onnx";
 
 const canvas = document.getElementById("board");
 const ctx = canvas.getContext("2d");
@@ -16,6 +20,23 @@ let drawing = false;
 let lastX = 0;
 let lastY = 0;
 let lastPrediction = null; // kept so charts can be redrawn if the theme flips
+
+// ---- load the model once, up front ----
+predictBtn.disabled = true;
+statusEl.textContent = "Loading model...";
+const sessionPromise = ort.InferenceSession.create(MODEL_URL, {
+  executionProviders: ["wasm"],
+}).then((session) => {
+  predictBtn.disabled = false;
+  statusEl.textContent = "";
+  return session;
+}).catch((err) => {
+  statusEl.textContent = "Could not load the model. Try reloading the page.";
+  console.error(err);
+  throw err;
+});
+
+// ---- drawing ----
 
 function resetCanvas() {
   ctx.fillStyle = "#14110c";
@@ -80,40 +101,171 @@ clearBtn.addEventListener("click", () => {
   lastPrediction = null;
 });
 
+// ---- digit segmentation (connected-component labeling, replaces cv2.findContours) ----
+
+function thresholdToBinary(imageData, width, height) {
+  const { data } = imageData;
+  const binary = new Uint8Array(width * height);
+  for (let i = 0; i < width * height; i++) {
+    binary[i] = data[i * 4] > 100 ? 1 : 0; // red channel; strokes are near-white, bg near-black
+  }
+  return binary;
+}
+
+function findComponents(binary, width, height) {
+  const visited = new Uint8Array(width * height);
+  const stackX = new Int32Array(width * height);
+  const stackY = new Int32Array(width * height);
+  const boxes = [];
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = y * width + x;
+      if (!binary[idx] || visited[idx]) continue;
+
+      let sp = 0;
+      stackX[sp] = x;
+      stackY[sp] = y;
+      sp++;
+      visited[idx] = 1;
+
+      let minX = x, maxX = x, minY = y, maxY = y;
+
+      while (sp > 0) {
+        sp--;
+        const cx = stackX[sp];
+        const cy = stackY[sp];
+        if (cx < minX) minX = cx;
+        if (cx > maxX) maxX = cx;
+        if (cy < minY) minY = cy;
+        if (cy > maxY) maxY = cy;
+
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const nx = cx + dx, ny = cy + dy;
+            if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+            const nidx = ny * width + nx;
+            if (binary[nidx] && !visited[nidx]) {
+              visited[nidx] = 1;
+              stackX[sp] = nx;
+              stackY[sp] = ny;
+              sp++;
+            }
+          }
+        }
+      }
+
+      const w = maxX - minX + 1;
+      const h = maxY - minY + 1;
+      if (w * h < 30) continue; // skip tiny noise specks
+      boxes.push({ x: minX, y: minY, w, h });
+    }
+  }
+
+  boxes.sort((a, b) => a.x - b.x); // left to right
+  return boxes;
+}
+
+// pad each digit to a square (with a border, like real MNIST images) and
+// downscale to 28x28 - mirrors what the old server-side OpenCV code did
+function extractDigitTensor(binary, width, height, box) {
+  const { x, y, w, h } = box;
+  const side = Math.max(w, h);
+  const pad = Math.floor(side / 4) + 2;
+  const squareSize = side + 2 * pad;
+  const xOff = pad + Math.floor((side - w) / 2);
+  const yOff = pad + Math.floor((side - h) / 2);
+
+  const squareData = new Uint8ClampedArray(squareSize * squareSize * 4);
+  for (let i = 3; i < squareData.length; i += 4) squareData[i] = 255; // opaque
+
+  for (let ry = 0; ry < h; ry++) {
+    for (let rx = 0; rx < w; rx++) {
+      const val = binary[(y + ry) * width + (x + rx)] ? 255 : 0;
+      const dstIdx = ((yOff + ry) * squareSize + (xOff + rx)) * 4;
+      squareData[dstIdx] = val;
+      squareData[dstIdx + 1] = val;
+      squareData[dstIdx + 2] = val;
+    }
+  }
+
+  const srcCanvas = document.createElement("canvas");
+  srcCanvas.width = squareSize;
+  srcCanvas.height = squareSize;
+  srcCanvas.getContext("2d").putImageData(new ImageData(squareData, squareSize, squareSize), 0, 0);
+
+  const dstCanvas = document.createElement("canvas");
+  dstCanvas.width = 28;
+  dstCanvas.height = 28;
+  const dctx = dstCanvas.getContext("2d");
+  dctx.imageSmoothingEnabled = true;
+  dctx.imageSmoothingQuality = "high";
+  dctx.drawImage(srcCanvas, 0, 0, squareSize, squareSize, 0, 0, 28, 28);
+
+  const pixels = dctx.getImageData(0, 0, 28, 28).data;
+  const tensor = new Float32Array(28 * 28);
+  for (let i = 0; i < 28 * 28; i++) {
+    tensor[i] = pixels[i * 4] / 255;
+  }
+  return tensor;
+}
+
+function softmax(row) {
+  const max = Math.max(...row);
+  const exps = row.map((v) => Math.exp(v - max));
+  const sum = exps.reduce((a, b) => a + b, 0);
+  return exps.map((v) => v / sum);
+}
+
 predictBtn.addEventListener("click", async () => {
   statusEl.textContent = "Thinking...";
   resultNumber.textContent = "--";
 
-  const dataURL = canvas.toDataURL("image/png");
-
   try {
-    const res = await fetch(`${API_URL}/predict`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ image: dataURL }),
-    });
+    const session = await sessionPromise;
 
-    const data = await res.json();
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const binary = thresholdToBinary(imageData, canvas.width, canvas.height);
+    const boxes = findComponents(binary, canvas.width, canvas.height);
 
-    if (!res.ok) {
-      statusEl.textContent = data.error || "Something went wrong.";
+    if (boxes.length === 0) {
+      statusEl.textContent = "No digits detected. Try drawing bigger.";
       return;
     }
 
-    if (!data.number) {
-      statusEl.textContent = data.message || "No digits detected. Try drawing bigger.";
-      return;
+    const tensors = boxes.map((box) => extractDigitTensor(binary, canvas.width, canvas.height, box));
+    const batch = new Float32Array(tensors.length * 28 * 28);
+    tensors.forEach((t, i) => batch.set(t, i * 28 * 28));
+
+    const inputTensor = new ort.Tensor("float32", batch, [tensors.length, 1, 28, 28]);
+    const results = await session.run({ input: inputTensor });
+    const logits = results.logits.data; // Float32Array, shape [N, 10]
+
+    const digits = [];
+    const confidences = [];
+    const probabilities = [];
+    for (let i = 0; i < tensors.length; i++) {
+      const row = Array.from(logits.slice(i * 10, i * 10 + 10));
+      const probs = softmax(row);
+      let best = 0;
+      for (let d = 1; d < 10; d++) if (probs[d] > probs[best]) best = d;
+      digits.push(best);
+      confidences.push(probs[best]);
+      probabilities.push(probs);
     }
 
-    resultNumber.textContent = data.number;
-    const avgConfidence =
-      (data.confidences.reduce((a, b) => a + b, 0) / data.confidences.length) * 100;
+    const number = digits.join("");
+    resultNumber.textContent = number;
+    const avgConfidence = (confidences.reduce((a, b) => a + b, 0) / confidences.length) * 100;
     statusEl.textContent = `Confidence: ${avgConfidence.toFixed(1)}%`;
 
+    const data = { digits, confidences, probabilities, number };
     lastPrediction = data;
     renderBreakdown(data);
   } catch (err) {
-    statusEl.textContent = "Could not reach the API. Is app.py running?";
+    statusEl.textContent = "Something went wrong running the model.";
+    console.error(err);
   }
 });
 
