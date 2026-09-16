@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CNN Digit Recognizer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@400;500;600;700&family=Quicksand:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="blob blob-a" aria-hidden="true"></div>
+  <div class="blob blob-b" aria-hidden="true"></div>
+  <div class="blob blob-c" aria-hidden="true"></div>
+
+  <main class="card">
+    <header class="card-header">
+      <h1>🌿 Digit Recognizer</h1>
+      <p class="subtitle">Write a number below (e.g. <strong>100</strong>) and let the CNN read it back.</p>
+    </header>
+
+    <div class="layout">
+      <section class="panel-draw">
+        <div class="canvas-wrap">
+          <canvas id="board" width="560" height="200"></canvas>
+        </div>
+
+        <div class="controls">
+          <button id="predictBtn">✏️ Predict</button>
+          <button id="clearBtn" class="secondary">Clear</button>
+        </div>
+
+        <div class="result">
+          <span class="result-label">Prediction</span>
+          <span id="resultNumber">--</span>
+        </div>
+        <div id="status" class="status"></div>
+      </section>
+
+      <section class="panel-chart">
+        <h2>What the AI saw</h2>
+        <p id="chartPlaceholder" class="chart-placeholder">
+          Draw a number and hit Predict — a confidence chart for each digit shows up here.
+        </p>
+        <div id="chartRow" class="chart-col" hidden></div>
+      </section>
+    </div>
+  </main>
+
+  <template id="digitCardTemplate">
+    <div class="digit-card">
+      <div class="digit-card-head">
+        <span class="digit-value"></span>
+        <span class="digit-confidence"></span>
+      </div>
+      <canvas class="digit-chart" width="280" height="150"></canvas>
+    </div>
+  </template>
+
+  <script src="script.js"></script>
+</body>
+</html>
