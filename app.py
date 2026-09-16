@@ -22,8 +22,9 @@ from PIL import Image
 from train_model import DigitCNN
 
 MODEL_PATH = "model/mnist_cnn.pt"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-app = Flask(__name__, static_folder="static", static_url_path="")
+app = Flask(__name__, static_folder=None)
 CORS(app)  # allow the frontend to call this API even if hosted elsewhere
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -85,7 +86,17 @@ def extract_digits(gray: np.ndarray):
 
 @app.route("/")
 def index():
-    return send_from_directory(app.static_folder, "index.html")
+    return send_from_directory(BASE_DIR, "index.html")
+
+
+@app.route("/style.css")
+def style():
+    return send_from_directory(BASE_DIR, "style.css")
+
+
+@app.route("/script.js")
+def script():
+    return send_from_directory(BASE_DIR, "script.js")
 
 
 @app.route("/predict", methods=["POST"])
